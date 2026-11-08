@@ -8,11 +8,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use anyhow::Result;
-use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::input::ControlState;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Protocol {
     WebSocket,
     Mavlink,
@@ -31,7 +31,8 @@ impl Protocol {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub protocol: Protocol,
     pub ws_url: String,
@@ -104,10 +105,10 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn(ctx: egui::Context) -> Self {
+    pub fn spawn() -> Self {
         let (tx, cmd_rx) = mpsc::channel();
         let (ev_tx, events) = mpsc::channel();
-        thread::spawn(move || run(cmd_rx, ev_tx, ctx));
+        thread::spawn(move || run(cmd_rx, ev_tx));
         Self { tx, events }
     }
 
@@ -116,12 +117,11 @@ impl Worker {
     }
 }
 
-fn run(cmd_rx: Receiver<Command>, ev_tx: Sender<Event>, ctx: egui::Context) {
+fn run(cmd_rx: Receiver<Command>, ev_tx: Sender<Event>) {
     // Created inside this thread, so transports don't need to be `Send`.
     let mut transport: Option<Box<dyn Transport>> = None;
     let emit = |e: Event| {
         let _ = ev_tx.send(e);
-        ctx.request_repaint();
     };
 
     while let Ok(first) = cmd_rx.recv() {

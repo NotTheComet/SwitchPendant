@@ -1,43 +1,57 @@
-use std::time::{Duration, Instant};
+//! The window: a view onto the always-running core. Closing it does not stop teleop.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use eframe::egui::{self, vec2, Color32, RichText, Sense, Stroke, Vec2};
 
-use crate::input::{ControlState, Input, BUTTONS};
-use crate::transport::{Command, Config, Event, Protocol, Worker};
-
-enum Status {
-    Disconnected,
-    Connecting,
-    Connected(String),
-}
+use crate::core::{CoreCmd, CoreHandle, Snapshot, Status};
+use crate::input::{self, BUTTONS};
+use crate::settings;
+use crate::transport::{Config, Protocol};
+use crate::tray::UiCmd;
+use crate::SharedUiRx;
 
 pub struct TeleopApp {
+    core: CoreHandle,
+    ui_rx: SharedUiRx,
+    quit: Arc<AtomicBool>,
+
+    snap: Snapshot,
+    /// Editable copy of the config; pushed to the core when it changes.
     cfg: Config,
-    input: Input,
-    state: ControlState,
-    worker: Worker,
-    status: Status,
-    last_error: Option<String>,
-    last_send: Instant,
-    sent: u64,
+    synced_cfg: Config,
+    keyboard_was_active: bool,
+    autostart: bool,
+    ui_error: Option<String>,
 }
 
 impl TeleopApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(core: CoreHandle, ui_rx: SharedUiRx, quit: Arc<AtomicBool>) -> Self {
+        let snap = core.snapshot();
         Self {
-            cfg: Config::default(),
-            input: Input::new(),
-            state: ControlState::default(),
-            worker: Worker::spawn(cc.egui_ctx.clone()),
-            status: Status::Disconnected,
-            last_error: None,
-            last_send: Instant::now(),
-            sent: 0,
+            cfg: snap.cfg.clone(),
+            synced_cfg: snap.cfg.clone(),
+            snap,
+            core,
+            ui_rx,
+            quit,
+            keyboard_was_active: false,
+            autostart: settings::autostart_enabled(),
+            ui_error: None,
+        }
+    }
+
+    fn sync_config(&mut self) {
+        if self.cfg != self.synced_cfg {
+            self.core.send(CoreCmd::SetConfig(self.cfg.clone()));
+            self.synced_cfg = self.cfg.clone();
         }
     }
 
     fn connection_panel(&mut self, ui: &mut egui::Ui) {
-        let idle = matches!(self.status, Status::Disconnected);
+        let idle = matches!(self.snap.status, Status::Disconnected);
 
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(idle, |ui| {
@@ -80,17 +94,15 @@ impl TeleopApp {
 
             if idle {
                 if ui.button("Connect").clicked() {
-                    self.worker.send(Command::Connect(self.cfg.clone()));
-                    self.status = Status::Connecting;
-                    self.last_error = None;
+                    self.core.send(CoreCmd::Connect(Some(self.cfg.clone())));
+                    self.synced_cfg = self.cfg.clone();
                 }
             } else if ui.button("Disconnect").clicked() {
-                self.worker.send(Command::Disconnect);
-                self.status = Status::Disconnected;
+                self.core.send(CoreCmd::Disconnect);
             }
         });
 
-        ui.horizontal(|ui| match &self.status {
+        ui.horizontal(|ui| match &self.snap.status {
             Status::Disconnected => {
                 ui.colored_label(Color32::GRAY, "● Disconnected");
             }
@@ -99,51 +111,81 @@ impl TeleopApp {
             }
             Status::Connected(d) => {
                 ui.colored_label(Color32::from_rgb(60, 200, 100), format!("● Connected: {d}"));
-                ui.label(format!("({} msgs sent)", self.sent));
+                ui.label(format!("({} msgs sent)", self.snap.sent));
+            }
+            Status::Retrying(_) => {
+                ui.colored_label(Color32::from_rgb(230, 80, 80), "● Link down, retrying…");
             }
         });
-        if let Some(err) = &self.last_error {
+        if let Some(err) = self.snap.last_error.as_ref().or(self.ui_error.as_ref()) {
             ui.colored_label(Color32::from_rgb(230, 80, 80), err);
         }
+    }
+
+    fn footer(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut self.autostart, "Start at login").changed() {
+                self.ui_error = settings::set_autostart(self.autostart)
+                    .err()
+                    .map(|e| format!("autostart: {e:#}"));
+                self.autostart = settings::autostart_enabled();
+            }
+            ui.weak("Closing this window keeps Teleop running in the tray.");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Quit").clicked() {
+                    self.quit.store(true, Ordering::SeqCst);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+        });
     }
 }
 
 impl eframe::App for TeleopApp {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        while let Ok(ev) = self.worker.events.try_recv() {
-            match ev {
-                Event::Connected(desc) => self.status = Status::Connected(desc),
-                Event::Disconnected => self.status = Status::Disconnected,
-                Event::Error(e) => {
-                    self.status = Status::Disconnected;
-                    self.last_error = Some(e);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Requests from the tray while the window is already open.
+        if let Ok(rx) = self.ui_rx.try_lock() {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    UiCmd::Show => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus),
+                    UiCmd::Quit => {
+                        self.quit.store(true, Ordering::SeqCst);
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
             }
         }
 
-        self.state = self.input.poll(ui);
-
-        let period = Duration::from_secs_f32(1.0 / self.cfg.rate_hz.max(1.0));
-        if matches!(self.status, Status::Connected(_)) && self.last_send.elapsed() >= period {
-            self.worker.send(Command::Send(self.state.clone()));
-            self.last_send = Instant::now();
-            self.sent += 1;
+        // Keyboard fallback goes to the core, which uses it only when no gamepad is present.
+        let kb = input::from_keyboard(ui.ctx());
+        let kb_active = !kb.is_idle();
+        if kb_active || self.keyboard_was_active {
+            self.core.send(CoreCmd::Keyboard(kb));
         }
+        self.keyboard_was_active = kb_active;
 
-        egui::Panel::top("connection").show(ui, |ui| {
+        self.snap = self.core.snapshot();
+
+        egui::Panel::top("connection").show_inside(ui, |ui| {
             ui.add_space(4.0);
             self.connection_panel(ui);
             ui.add_space(4.0);
         });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(e) = &self.input.init_error {
+        egui::Panel::bottom("footer").show_inside(ui, |ui| {
+            ui.add_space(4.0);
+            self.footer(ui);
+            ui.add_space(4.0);
+        });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            if let Some(e) = &self.snap.input_error {
                 ui.colored_label(Color32::from_rgb(230, 80, 80), e);
             }
-            ui.label(format!("Input: {}", self.state.source));
+            ui.label(format!("Input: {}", self.snap.state.source));
             ui.separator();
 
-            let a = &self.state.axes;
+            let a = &self.snap.state.axes;
             ui.horizontal(|ui| {
                 stick(ui, "Left stick", a.lx, a.ly);
                 ui.add_space(24.0);
@@ -164,7 +206,7 @@ impl eframe::App for TeleopApp {
             ui.separator();
             ui.label(RichText::new("Buttons").strong());
             ui.horizontal_wrapped(|ui| {
-                for ((_, name), &pressed) in BUTTONS.iter().zip(&self.state.buttons) {
+                for ((_, name), &pressed) in BUTTONS.iter().zip(&self.snap.state.buttons) {
                     let (bg, fg) = if pressed {
                         (Color32::from_rgb(40, 160, 80), Color32::WHITE)
                     } else {
@@ -175,8 +217,10 @@ impl eframe::App for TeleopApp {
             });
         });
 
-        // Gamepads are polled, not event-driven, so keep repainting.
-        ui.request_repaint_after(Duration::from_millis(10));
+        self.sync_config();
+
+        // Core state changes without egui events, so keep refreshing while the window is open.
+        ui.ctx().request_repaint_after(Duration::from_millis(16));
     }
 }
 

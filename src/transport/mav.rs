@@ -1,6 +1,8 @@
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, Result};
 use mavlink::{
-    dialects::common::{MavMessage, MANUAL_CONTROL_DATA},
+    dialects::common::{MavAutopilot, MavMessage, MavType, HEARTBEAT_DATA, MANUAL_CONTROL_DATA},
     MavConnection, MavHeader,
 };
 
@@ -11,6 +13,7 @@ pub struct MavTransport {
     conn: Box<dyn MavConnection<MavMessage> + Sync + Send>,
     header: MavHeader,
     target: u8,
+    last_heartbeat: Option<Instant>,
 }
 
 impl MavTransport {
@@ -22,6 +25,7 @@ impl MavTransport {
             // GCS-style identity: system 255, component 190 (mission planner).
             header: MavHeader { system_id: 255, component_id: 190, sequence: 0 },
             target: cfg.mav_target,
+            last_heartbeat: None,
         })
     }
 }
@@ -32,6 +36,18 @@ fn scale(v: f32) -> i16 {
 
 impl Transport for MavTransport {
     fn send(&mut self, s: &ControlState) -> Result<()> {
+        // 1 Hz GCS heartbeat so the autopilot's GCS failsafe stays happy.
+        if self.last_heartbeat.map_or(true, |t| t.elapsed() >= Duration::from_secs(1)) {
+            self.last_heartbeat = Some(Instant::now());
+            let hb = MavMessage::HEARTBEAT(HEARTBEAT_DATA {
+                mavtype: MavType::MAV_TYPE_GCS,
+                autopilot: MavAutopilot::MAV_AUTOPILOT_INVALID,
+                ..Default::default()
+            });
+            self.header.sequence = self.header.sequence.wrapping_add(1);
+            self.conn.send(&self.header, &hb).map_err(|e| anyhow!("mavlink send: {e:?}"))?;
+        }
+
         let a = &s.axes;
         let buttons = s
             .buttons

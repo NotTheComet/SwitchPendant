@@ -47,6 +47,12 @@ pub struct ControlState {
 }
 
 impl ControlState {
+    /// True when no stick is deflected and nothing is pressed.
+    pub fn is_idle(&self) -> bool {
+        let a = &self.axes;
+        [a.lx, a.ly, a.rx, a.ry, a.lt, a.rt].iter().all(|v| *v == 0.0) && !self.buttons.iter().any(|b| *b)
+    }
+
     pub fn to_json(&self) -> Value {
         let buttons: Map<String, Value> = BUTTONS
             .iter()
@@ -85,22 +91,19 @@ impl Input {
         }
     }
 
-    pub fn poll(&mut self, ctx: &egui::Context) -> ControlState {
-        if let Some(g) = self.gilrs.as_mut() {
-            // Draining events keeps gilrs' cached state current and tells us
-            // which pad the user is actually touching.
-            while let Some(ev) = g.next_event() {
-                self.active = Some(ev.id);
-            }
-            let pad = self
-                .active
-                .and_then(|id| g.connected_gamepad(id))
-                .or_else(|| g.gamepads().next().map(|(_, p)| p));
-            if let Some(pad) = pad {
-                return from_pad(&pad);
-            }
+    /// Current state of the active gamepad, or `None` if no gamepad is connected.
+    pub fn poll_gamepad(&mut self) -> Option<ControlState> {
+        let g = self.gilrs.as_mut()?;
+        // Draining events keeps gilrs' cached state current and tells us
+        // which pad the user is actually touching.
+        while let Some(ev) = g.next_event() {
+            self.active = Some(ev.id);
         }
-        from_keyboard(ctx)
+        let pad = self
+            .active
+            .and_then(|id| g.connected_gamepad(id))
+            .or_else(|| g.gamepads().next().map(|(_, p)| p))?;
+        Some(from_pad(&pad))
     }
 }
 
@@ -132,7 +135,7 @@ fn from_pad(pad: &gilrs::Gamepad) -> ControlState {
 }
 
 /// WASD = left stick, arrows = right stick, Space = south, Enter = start.
-fn from_keyboard(ctx: &egui::Context) -> ControlState {
+pub fn from_keyboard(ctx: &egui::Context) -> ControlState {
     let source = "keyboard (WASD / arrows / Space / Enter)".to_string();
     if ctx.egui_wants_keyboard_input() {
         return ControlState { source, ..Default::default() };
